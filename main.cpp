@@ -485,6 +485,13 @@ class http_session : public std::enable_shared_from_this<http_session>
             items_.reserve(limit);
         }
 
+        // Returns `true` if queue is empty
+        bool
+        is_empty() const
+        {
+            return items_.size() == 0;
+        }
+
         // Returns `true` if we have reached the queue limit
         bool
         is_full() const
@@ -615,6 +622,22 @@ public:
         // Verify that the timer really expired since the deadline may have moved.
         if(timer_.expiry() <= std::chrono::steady_clock::now())
         {
+            // Verify that all pending writes are complete.
+            if (!queue_.is_empty() && socket_.is_open())
+            {
+                // Timer is expired but we have pending writes, so defer timeouts.
+                timer_.expires_after(std::chrono::seconds(2));
+
+                // Wait on the timer
+                timer_.async_wait(
+                    boost::asio::bind_executor(
+                        strand_,
+                        std::bind(
+                            &http_session::on_timer,
+                            shared_from_this(),
+                            std::placeholders::_1)));
+                return;
+            }
             // Closing the socket cancels all outstanding operations. They
             // will complete with boost::asio::error::operation_aborted
             socket_.shutdown(tcp::socket::shutdown_both, ec);
@@ -644,7 +667,10 @@ public:
             return do_close();
 
         if(ec)
-            return fail(ec, "read");
+        {
+            fail(ec, "read");
+            return do_close_both();
+        }
 
         // See if it is a WebSocket Upgrade
         if(websocket::is_upgrade(req_))
@@ -670,8 +696,10 @@ public:
         if(ec == boost::asio::error::operation_aborted)
             return;
 
-        if(ec)
-            return fail(ec, "write");
+        if(ec) {
+            fail(ec, "write");
+            return do_close_both();
+        }
 
         if(close)
         {
@@ -696,6 +724,16 @@ public:
         socket_.shutdown(tcp::socket::shutdown_send, ec);
 
         // At this point the connection is closed gracefully
+    }
+
+    void
+    do_close_both()
+    {
+        // Closing the socket cancels all outstanding operations. They
+        // will complete with boost::asio::error::operation_aborted
+        boost::system::error_code ec;
+        socket_.shutdown(tcp::socket::shutdown_both, ec);
+        socket_.close(ec);
     }
 };
 
